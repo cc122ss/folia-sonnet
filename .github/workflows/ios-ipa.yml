@@ -169,39 +169,54 @@ jobs:
 
           rm -rf "${{ github.workspace }}/ipa"
           mkdir -p "${{ github.workspace }}/ipa"
-          cp -R "$APP_PATH" "${{ github.workspace }}/ipa/Payload"
+          # 必须把 App.app 整个拷成 Payload/App.app。
+          # 直接 cp -R "$APP_PATH" ".../ipa/Payload" 在 Payload 已存在时
+          # 会把 App.app 的**内容**摊进 Payload/（得到 Payload/App、Payload/Info.plist），
+          # 而不是 Payload/App.app/ —— 那样打出来的 ipa 结构不对，装上去直接不能用。
+          # ditto 是 macOS 上复制 app bundle 的标准工具，会完整保留目录结构。
+          if command -v ditto >/dev/null 2>&1; then
+            ditto "$APP_PATH" "${{ github.workspace }}/ipa/Payload/App.app"
+          else
+            mkdir -p "${{ github.workspace }}/ipa/Payload"
+            cp -R "$APP_PATH" "${{ github.workspace }}/ipa/Payload/App.app"
+          fi
           cd "${{ github.workspace }}/ipa"
           zip -qry "Folia-unsigned.ipa" Payload
+          echo "--- IPA 内结构（应看到 Payload/App.app/...）---"
+          unzip -l "Folia-unsigned.ipa" | head -20
           ls -la "Folia-unsigned.ipa"
 
       # 装不装得成主要看两件事：web 资源有没有真的进包，
       # 以及 bundle id 对不对。
       #
-      # 这里只做检查与打印，**不让检查失败挡住上传**：
-      # IPA 本身已经打好了，一个断言写错不该让整轮白跑。
-      # 真出问题时，日志里的清单能直接看出缺什么。
+      # 结构检查是**硬失败**：IPA 的目录结构错了（不是 Payload/App.app/...），
+      # 装上去会直接打不开，白白让用户折腾一轮，必须在这里挡住。
       - name: Verify IPA contents
         run: |
           set -uo pipefail
           cd "${{ github.workspace }}/ipa"
-          echo "--- IPA 内文件清单（前 40 条）---"
-          unzip -l "Folia-unsigned.ipa" | head -40
+          echo "--- IPA 内文件清单（前 30 条）---"
+          unzip -l "Folia-unsigned.ipa" | head -30
 
-          echo "--- 关键文件检查 ---"
-          if unzip -l "Folia-unsigned.ipa" | grep -qF "App.app/public/index.html"; then
+          echo "--- 结构检查 ---"
+          STRUCT_OK=1
+          if unzip -l "Folia-unsigned.ipa" | grep -qF "Payload/App.app/Info.plist"; then
+            echo "[OK] Payload/App.app/Info.plist"
+          else
+            echo "[FAIL] 缺少 Payload/App.app/Info.plist —— 包结构不对"
+            STRUCT_OK=0
+          fi
+          if unzip -l "Folia-unsigned.ipa" | grep -qE "Payload/App\.app/App$"; then
+            echo "[OK] 主程序 Payload/App.app/App"
+          else
+            echo "[FAIL] 缺少主程序 Payload/App.app/App"
+            STRUCT_OK=0
+          fi
+          if unzip -l "Folia-unsigned.ipa" | grep -qF "Payload/App.app/public/index.html"; then
             echo "[OK] web 产物已进包"
           else
-            echo "[WARN] 没找到 public/index.html —— 检查 cap sync ios 是否执行"
-          fi
-          if unzip -l "Folia-unsigned.ipa" | grep -qF "App.app/Info.plist"; then
-            echo "[OK] Info.plist 存在"
-          else
-            echo "[WARN] 缺少 Info.plist"
-          fi
-          if unzip -l "Folia-unsigned.ipa" | grep -qE "App\.app/App$"; then
-            echo "[OK] 主程序 App 存在"
-          else
-            echo "[WARN] 缺少主程序 App"
+            echo "[FAIL] 缺少 Payload/App.app/public/index.html —— cap sync ios 没跑或结构错"
+            STRUCT_OK=0
           fi
 
           echo "--- bundle id ---"
@@ -209,6 +224,12 @@ jobs:
             | grep -A1 CFBundleIdentifier | tail -1 | tr -d ' \t' || true
           echo "--- IPA 大小 ---"
           ls -la "Folia-unsigned.ipa"
+
+          if [ "$STRUCT_OK" -ne 1 ]; then
+            echo "::error::IPA 结构校验未通过，不上传这个包"
+            exit 1
+          fi
+          echo "IPA 结构校验通过"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
