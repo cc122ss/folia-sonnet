@@ -125,6 +125,10 @@ jobs:
       #
       # 用 -project 而不是 -workspace：Capacitor 8 的 SPM 模式下
       # 没有顶层 App.xcworkspace，只有 App.xcodeproj。
+      #
+      # 用 archive 而不是 build：build 只把 App.app 落在 DerivedData 里，
+      # 拿不到归档产物；archive 才会生成 .xcarchive，
+      # 里面才有可打包的 App.app。
       - name: Archive app (unsigned)
         run: |
           set -euo pipefail
@@ -140,18 +144,32 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
-            build
+            archive
 
       # 把 .xcarchive 里的 App.app 塞进 Payload/ 再压成 .ipa。
       # 这就是 IPA 的物理结构：一个 zip，里面放一个名为 Payload 的目录。
       - name: Package unsigned IPA
         run: |
           set -euo pipefail
-          APP_PATH="${{ github.workspace }}/build/App.xcarchive/Products/Applications/App.app"
-          test -d "$APP_PATH" || { echo "归档里没有 App.app"; exit 1; }
-          rm -rf "${{ github.workspace }}/ipa/Payload"
+          ARCHIVE="${{ github.workspace }}/build/App.xcarchive"
+          test -d "$ARCHIVE" || { echo "没有产出 .xcarchive"; exit 1; }
+          echo "--- 归档内容 ---"
+          ls -la "$ARCHIVE"
+          echo "--- Products 目录 ---"
+          ls -la "$ARCHIVE/Products/" 2>/dev/null || true
+          ls -la "$ARCHIVE/Products/Applications/" 2>/dev/null || true
+
+          # 归档里 App.app 的实际位置在不同 Xcode 版本下略有差异，
+          # 所以不写死路径，直接搜出来用。
+          APP_PATH="$(find "$ARCHIVE" -maxdepth 4 -name 'App.app' -type d | head -1)"
+          if [ -z "$APP_PATH" ]; then
+            echo "归档里没有 App.app"; exit 1
+          fi
+          echo "使用 App.app: $APP_PATH"
+
+          rm -rf "${{ github.workspace }}/ipa"
           mkdir -p "${{ github.workspace }}/ipa"
-          cp -R "$APP_PATH" "${{ github.workspace }}/ipa/Payload/"
+          cp -R "$APP_PATH" "${{ github.workspace }}/ipa/Payload"
           cd "${{ github.workspace }}/ipa"
           zip -qry "Folia-unsigned.ipa" Payload
           ls -la "Folia-unsigned.ipa"
