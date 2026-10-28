@@ -1,0 +1,217 @@
+name: iOS Unsigned IPA
+
+# 在 macOS runner 上把 Web 产物包成 iOS 应用，产出**未签名**的 .ipa。
+#
+# 为什么要走 CI：iOS 的编译链（xcodebuild / iOS SDK）只在 macOS 上有，
+# Windows 本机无论如何都编不出来。GitHub 的 macOS runner 相当于一台
+# 随时可租的 Mac —— 这里用它做「远程编译器」。
+#
+# 为什么产出的是未签名包：runner 上没有 Apple 开发者证书。
+# 未签名的 ipa 不能直接装到手机上，但可以用 Sideloadly / AltStore
+# 之类的工具，用你自己的 Apple ID 在本机重新签名后再装。
+# 免费 Apple ID 签出来的包有效期 7 天，到期重签即可。
+#
+# 触发方式：
+#   1. 推 tag（v*）自动触发
+#   2. 在 Actions 页面手动点 "Run workflow"
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-ios-ipa:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      # vite build 这棵树在默认堆上限下偶发 OOM；runner 有 7GB，给到 6GB 留余量。
+      NODE_OPTIONS: --max-old-space-size=6144
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      # 这棵依赖树 1.4GB（onnxruntime-node 原生库 285MB + electron 43 的 dist 313MB），
+      # 冷启动要五分钟，命中缓存直接省掉。
+      - name: Restore node_modules
+        id: node-modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-macos-15-node24-${{ hashFiles('package-lock.json') }}
+
+      # 用 npm install 而不是 npm ci：@capacitor/ios 是新加的依赖，
+      # package-lock.json 里还没有它的记录，npm ci 遇到
+      # 「lock 文件与 package.json 不同步」会直接失败。
+      # lock 文件在 CI 上会被顺手更新，不会影响构建产物。
+      - name: Install dependencies
+        if: steps.node-modules.outputs.cache-hit != 'true'
+        run: npm install --no-audit --no-fund
+
+      # capacitor.config.ts / capacitor.config.json 里 appId 就是 bundle id，
+      # 必须与 Apple Developer 后台注册的 App ID 完全一致，
+      # 否则重签名时会因为 profile 里没有这个 bundle id 而失败。
+      - name: Show bundle identifier
+        run: |
+          set -euo pipefail
+          if [ -f capacitor.config.json ]; then
+            node -e "const c=require('./capacitor.config.json'); console.log('appId:', c.appId, '| appName:', c.appName);"
+          else
+            node -e "const c=require('./capacitor.config.ts');" 2>/dev/null \
+              || grep -E "appId|appName" capacitor.config.ts || true
+          fi
+
+      # Capacitor 8 要求 Xcode 26+（iOS 15+ 部署目标）。
+      # macos-15 镜像里装了 26.0.1 / 26.1.1 / 26.2 / 26.3，默认选中的是 16.4，
+      # 这里显式切到 26.x，否则编译会因为 SDK 版本不匹配直接失败。
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          # 依次探测 26.x 的几个版本，选第一个存在的 —— 镜像更新后
+          # 具体装了哪个小版本会变，写死一个版本号容易某天突然失效。
+          for V in 26.3 26.2 26.1.1 26.0.1; do
+            if [ -d "/Applications/Xcode_${V}.app" ]; then
+              echo "使用 Xcode ${V}"
+              sudo xcode-select -s "/Applications/Xcode_${V}.app"
+              break
+            fi
+          done
+          xcodebuild -version
+          xcrun swift --version
+
+      # 一条命令两件事：vite build（FOLIA_BUILD_TARGET=capacitor）+ cap sync ios。
+      # capacitor 构建目标下 vite 用相对路径 './' 作为 base，且不注册 PWA
+      # Service Worker —— 资源从 App 内的本地目录加载，这是移动端容器的前提。
+      # 分开写容易漏掉同步那一步，而漏了之后打出来的包照样是绿的，
+      # 只有装机才发现前端还是旧的。
+      - name: Build web assets and sync to iOS
+        run: npm run cap:sync:ios
+
+      # Capacitor 8 默认走 Swift Package Manager（ios/CapApp-SPM），
+      # 没有 Podfile，所以不需要 pod install。
+      # SPM 的依赖解析在 xcodebuild -resolvePackageDependencies 里完成。
+      - name: Resolve Swift Package dependencies
+        working-directory: ./ios/App
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -clonedSourcePackagesDirPath "${{ github.workspace }}/build/spm-cache"
+
+      # runner 上没有 Apple 证书，签名步骤必须整个关掉，
+      # 否则 xcodebuild 会卡在 "No profiles for 'com.xxx' were found"。
+      # 未签名产物由 Sideloadly / AltStore 在你本机用你的 Apple ID 重签。
+      - name: Archive app (unsigned)
+        run: |
+          set -euo pipefail
+          cd ios/App
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "${{ github.workspace }}/build/App.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+      # 把 .xcarchive 里的 App.app 塞进 Payload/ 再压成 .ipa。
+      # 这就是 IPA 的物理结构：一个 zip，里面放一个名为 Payload 的目录。
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="${{ github.workspace }}/build/App.xcarchive/Products/Applications/App.app"
+          test -d "$APP_PATH" || { echo "归档里没有 App.app"; exit 1; }
+          rm -rf "${{ github.workspace }}/ipa/Payload"
+          mkdir -p "${{ github.workspace }}/ipa"
+          cp -R "$APP_PATH" "${{ github.workspace }}/ipa/Payload/"
+          cd "${{ github.workspace }}/ipa"
+          zip -qry "Folia-unsigned.ipa" Payload
+          ls -la "Folia-unsigned.ipa"
+
+      # 装不装得成主要看两件事：web 资源有没有真的进包，
+      # 以及 bundle id 对不对。少任何一样，装上去都是白屏或者签名被拒。
+      - name: Verify IPA contents
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}/ipa"
+          unzip -l "Folia-unsigned.ipa" | grep -E "Payload/App.app/public/index.html" \
+            || { echo "Web 产物没进包 —— 大概率是 cap sync ios 那一步没跑"; exit 1; }
+          unzip -l "Folia-unsigned.ipa" | grep -E "Payload/App.app/Info.plist" \
+            || { echo "缺少 Info.plist"; exit 1; }
+          echo "IPA 内容校验通过"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: folia-ios-unsigned-ipa
+          path: ipa/Folia-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write install instructions
+        run: |
+          set -euo pipefail
+          cat > "${{ github.workspace }}/ipa/安装说明.md" <<'EOF'
+          # Folia iOS（未签名 IPA）安装说明
+
+          这个包是**未签名**的 —— CI 上没有 Apple 证书。
+          要装到 iPhone 上，必须先在你自己的电脑上用你的 Apple ID 重新签名。
+
+          ## 方式一：Sideloadly（Windows / macOS，推荐）
+
+          1. 电脑装 iTunes（Apple 官网版，**不要用 Microsoft Store 版**）和 iCloud（Apple 官网版）。
+          2. 下载 Sideloadly：https://sideloadly.io
+          3. 用数据线连上 iPhone，手机上点「信任此电脑」。
+          4. Sideloadly 里把 `Folia-unsigned.ipa` 拖进去。
+          5. 填入你的 Apple ID（建议用小号，Apple ID 会被上传到 Apple 服务器做签名）。
+          6. 点 Start，等它跑完。
+          7. 装完手机上会提示「未受信任的开发者」：
+             **设置 → 通用 → VPN 与设备管理 → 找到你的 Apple ID → 信任**。
+
+          ## 方式二：AltStore / SideStore
+
+          1. 电脑上装 AltServer，用 Apple ID 安装 AltStore 到手机。
+          2. 手机上打开 AltStore → My Apps → 左上角「+」→ 选择这个 ipa 文件。
+          3. 同上，需要去「设置 → 通用 → VPN 与设备管理」里信任证书。
+
+          ## 有效期
+
+          免费 Apple ID 签出来的包**有效期 7 天**，到期后会闪退，重新用上面的
+          流程签一次即可。付费开发者账号（688 块/年）签的是 1 年。
+
+          ## 注意
+
+          - 这个应用需要联网才能播放（走网易云/QQ音乐/酷狗的接口）。
+          - 开发者模式：iOS 16 及以上首次侧载需要开
+            **设置 → 隐私与安全性 → 开发者模式**。
+          EOF
+
+      - name: Upload install instructions
+        uses: actions/upload-artifact@v4
+        with:
+          name: folia-ios-install-guide
+          path: ipa/安装说明.md
+          if-no-files-found: warn
+          retention-days: 30
