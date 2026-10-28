@@ -106,30 +106,36 @@ jobs:
         run: npm run cap:sync:ios
 
       # Capacitor 8 默认走 Swift Package Manager（ios/CapApp-SPM），
-      # 没有 Podfile，所以不需要 pod install。
+      # 没有 Podfile，也没有顶层 App.xcworkspace —— 只有 App.xcodeproj。
+      # 所以这里用 -project 而不是 -workspace；用 -workspace 会报
+      # "'App.xcworkspace' does not exist"。
       # SPM 的依赖解析在 xcodebuild -resolvePackageDependencies 里完成。
       - name: Resolve Swift Package dependencies
         working-directory: ./ios/App
         run: |
           set -euo pipefail
           xcodebuild -resolvePackageDependencies \
-            -workspace App.xcworkspace \
+            -project App.xcodeproj \
             -scheme App \
             -clonedSourcePackagesDirPath "${{ github.workspace }}/build/spm-cache"
 
       # runner 上没有 Apple 证书，签名步骤必须整个关掉，
       # 否则 xcodebuild 会卡在 "No profiles for 'com.xxx' were found"。
       # 未签名产物由 Sideloadly / AltStore 在你本机用你的 Apple ID 重签。
+      #
+      # 用 -project 而不是 -workspace：Capacitor 8 的 SPM 模式下
+      # 没有顶层 App.xcworkspace，只有 App.xcodeproj。
       - name: Archive app (unsigned)
         run: |
           set -euo pipefail
           cd ios/App
           xcodebuild \
-            -workspace App.xcworkspace \
+            -project App.xcodeproj \
             -scheme App \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "${{ github.workspace }}/build/App.xcarchive" \
+            -clonedSourcePackagesDirPath "${{ github.workspace }}/build/spm-cache" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
